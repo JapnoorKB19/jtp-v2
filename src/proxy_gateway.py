@@ -15,7 +15,8 @@ class LocalProxy:
 
     def handle_client(self, tcp_client):
         request_data = tcp_client.recv(4096)
-        if not request_data: return
+        if not request_data: 
+            return
         
         print(f"\n[Proxy] Intercepted curl request. Tunneling via {self.protocol}...")
         
@@ -36,9 +37,11 @@ class LocalProxy:
                 sock.close()
                 
             elif self.protocol == 'JTP':
-                jtp_client = JTPSocket()
-                jtp_client.send_reliable(request_data, self.target)
+                # The V2 JTP Engine Execution
+                jtp_client = JTPSocket(target_addr=self.target)
+                jtp_client.send_reliable(request_data)
                 response_data, _ = jtp_client.receive_reliable()
+                jtp_client.close()  # Triggers the new FIN/ACK teardown handshake
             
             # Return response to curl
             tcp_client.sendall(response_data)
@@ -54,4 +57,5 @@ class LocalProxy:
         print(f"[*] Tunneling traffic to backend using: {self.protocol}")
         while True:
             client_sock, addr = self.tcp_server.accept()
+            # Handle multiple concurrent curl requests using threads
             threading.Thread(target=self.handle_client, args=(client_sock,), daemon=True).start()

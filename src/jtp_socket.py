@@ -1,98 +1,166 @@
 import socket
+import threading
 import time
-from src.jtp_header import JTPHeader
+from src.jtp_header import JTPHeader, FLAG_DATA, FLAG_ACK, FLAG_FIN
+
+CHUNK_SIZE = 1400
+WINDOW_SIZE = 5     # Send 5 packets before waiting for ACKs (Go-Back-N style)
+TIMEOUT = 0.5
 
 class JTPSocket:
-    MAX_PAYLOAD_SIZE = 1400
-    TIMEOUT = 1.0  # Seconds to wait for an ACK before retransmitting
-    MAX_RETRIES = 5
-
-    def __init__(self, host='127.0.0.1', port=None, is_server=False):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Set a small timeout for non-blocking receive operations
-        self.sock.settimeout(0.5) 
-        self.seq_num = 1000  # Starting sequence number
-        
-        if is_server and port:
-            self.sock.bind((host, port))
-            print(f"[*] JTP Server listening on {host}:{port}")
-
-    def send_reliable(self, data, dest_addr):
-        """Chunks data, applies JTP headers, and ensures reliable delivery."""
-        chunks = [data[i:i + self.MAX_PAYLOAD_SIZE] for i in range(0, len(data), self.MAX_PAYLOAD_SIZE)]
-        
-        for chunk in chunks:
-            self._send_chunk_with_retry(chunk, dest_addr)
-            self.seq_num += len(chunk) # Increment sequence number by bytes sent
-
-    def _send_chunk_with_retry(self, chunk, dest_addr):
-        """Handles the transmission and ACK waiting for a single chunk."""
-        header = JTPHeader(
-            flags=JTPHeader.FLAG_DATA,
-            window_size=64,
-            seq_num=self.seq_num,
-            ack_num=0,
-            payload_data=chunk
-        )
-        packet = header.pack() + chunk
-        
-        for attempt in range(self.MAX_RETRIES):
-            self.sock.sendto(packet, dest_addr)
-            # print(f"[->] Sent Seq: {self.seq_num}, Attempt: {attempt + 1}")
+    """Handles an individual, reliable JTP connection with Windowing and Teardown."""
+    def __init__(self, target_addr=None, existing_sock=None):
+        self.target_addr = target_addr
+        self.sock = existing_sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if not existing_sock:
+            self.sock.settimeout(TIMEOUT)
             
-            if self._wait_for_ack(self.seq_num + len(chunk)):
-                return  # ACK received, move to next chunk
-                
-            print(f"[!] Timeout! Retransmitting Seq: {self.seq_num}")
-            
-        raise ConnectionError(f"Failed to deliver packet {self.seq_num} after {self.MAX_RETRIES} retries.")
+        self.seq_num = 1000
+        self.expected_ack = 1000
+        self.state = "ESTABLISHED"
+        
+        # Buffer for incoming data
+        self.receive_buffer = b""
 
-    def _wait_for_ack(self, expected_ack_num):
-        """Listens for an ACK matching the expected sequence number."""
-        start_time = time.time()
-        while time.time() - start_time < self.TIMEOUT:
-            try:
-                raw_data, _ = self.sock.recvfrom(2048)
-                if len(raw_data) < JTPHeader.HEADER_SIZE:
+    def send_reliable(self, data, addr=None):
+        """Window-based sender (Allows multiple in-flight packets)."""
+        target = addr or self.target_addr
+        chunks = [data[i:i+CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
+        total_chunks = len(chunks)
+        
+        base = 0
+        while base < total_chunks:
+            window_end = min(base + WINDOW_SIZE, total_chunks)
+            for i in range(base, window_end):
+                chunk = chunks[i]
+                current_seq = self.seq_num + i
+                header = JTPHeader(flags=FLAG_DATA, seq_num=current_seq, payload_len=len(chunk), payload=chunk)
+                packet = header.pack() + chunk
+                self.sock.sendto(packet, target)
+            
+            ack_received = False
+            start_time = time.time()
+            while time.time() - start_time < TIMEOUT:
+                try:
+                    resp, peer_addr = self.sock.recvfrom(2048)
+                    resp_hdr = JTPHeader.unpack(resp)
+                    if resp_hdr.flags == FLAG_ACK and resp_hdr.ack_num >= self.seq_num + window_end:
+                        base = window_end
+                        self.seq_num = resp_hdr.ack_num
+                        ack_received = True
+                        
+                        # --- UDP SESSION MIGRATION FIX ---
+                        # If the server thread replied from a new ephemeral port, lock onto it!
+                        if self.target_addr and peer_addr != self.target_addr:
+                            self.target_addr = peer_addr
+                            target = peer_addr
+                        # ---------------------------------
+                        break
+                except (socket.timeout, ValueError):
                     continue
-                    
-                header = JTPHeader.unpack(raw_data[:JTPHeader.HEADER_SIZE])
-                if header.flags == JTPHeader.FLAG_ACK and header.ack_num == expected_ack_num:
-                    # print(f"[<-] Received valid ACK: {header.ack_num}")
-                    return True
-            except socket.timeout:
-                continue
-        return False
+            
+            if not ack_received:
+                print(f"[JTP] Timeout. Sliding Window retransmitting from sequence {self.seq_num + base}...")
 
     def receive_reliable(self):
-        """Listens for incoming JTP packets, verifies integrity, and sends ACKs."""
-        while True:
+        """Receives data and handles FIN teardown requests."""
+        while self.state != "CLOSED":
             try:
-                raw_data, addr = self.sock.recvfrom(2048)
-                if len(raw_data) < JTPHeader.HEADER_SIZE:
-                    continue
+                packet, peer_addr = self.sock.recvfrom(2048)
+                header = JTPHeader.unpack(packet)
+                
+                # --- UDP SESSION MIGRATION FIX ---
+                # Ensure the FIN handshake goes back to the exact thread that sent the data
+                if not self.target_addr or self.target_addr != peer_addr:
+                    self.target_addr = peer_addr
+                # ---------------------------------
 
-                header_bytes = raw_data[:JTPHeader.HEADER_SIZE]
-                payload = raw_data[JTPHeader.HEADER_SIZE:]
-                header = JTPHeader.unpack(header_bytes)
-
-                # 1. Cryptographic Integrity Check
-                if not header.verify_payload(payload):
-                    print(f"[!] Corrupted packet received from {addr}. Dropping.")
-                    continue  # Drop packet, sender will timeout and retransmit
-
-                if header.flags == JTPHeader.FLAG_DATA:
-                    # print(f"[+] Valid Data Received! Seq: {header.seq_num}. Sending ACK...")
-                    # 2. Send Acknowledgment back to sender
-                    ack_header = JTPHeader(
-                        flags=JTPHeader.FLAG_ACK,
-                        window_size=64,
-                        seq_num=0,
-                        ack_num=header.seq_num + len(payload)
-                    )
-                    self.sock.sendto(ack_header.pack(), addr)
+                if header.flags == FLAG_FIN:
+                    print(f"[JTP] FIN received from {peer_addr}. Closing connection.")
+                    self._send_ack(peer_addr, header.seq_num + 1)
+                    self.state = "CLOSED"
+                    return b"", peer_addr
                     
-                    return payload, addr
-
+                if header.flags == FLAG_DATA:
+                    self.receive_buffer += header.payload
+                    self.expected_ack = header.seq_num + 1
+                    self._send_ack(peer_addr, self.expected_ack)
+                    
+                    data = self.receive_buffer
+                    self.receive_buffer = b""
+                    return data, peer_addr
+                    
             except socket.timeout:
-                continue # Keep listening
+                continue
+            except ValueError:
+                pass
+
+    def _send_ack(self, addr, ack_num):
+        ack_hdr = JTPHeader(flags=FLAG_ACK, ack_num=ack_num)
+        self.sock.sendto(ack_hdr.pack(), addr)
+
+    def close(self):
+        """Formal FIN/ACK 4-way handshake teardown."""
+        if self.state == "CLOSED": return
+        self.state = "FIN_WAIT"
+        print(f"[JTP] Initiating FIN/ACK teardown to {self.target_addr}...")
+        
+        fin_hdr = JTPHeader(flags=FLAG_FIN, seq_num=self.seq_num)
+        self.sock.sendto(fin_hdr.pack(), self.target_addr)
+        
+        # Wait for FIN-ACK
+        try:
+            resp, _ = self.sock.recvfrom(2048)
+            resp_hdr = JTPHeader.unpack(resp)
+            if resp_hdr.flags == FLAG_ACK:
+                print("[JTP] Teardown complete. Socket closed gracefully.")
+                self.state = "CLOSED"
+        except socket.timeout:
+            pass
+        self.sock.close()
+
+
+class JTPServer:
+    """Multi-threaded Dispatcher: Routes raw UDP packets to isolated client handlers."""
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.main_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.main_sock.bind((self.host, self.port))
+        self.clients = {}  # Maps addresses to JTPSocket connection objects
+        print(f"[*] JTP Multi-Threaded Server listening on {host}:{port}")
+
+    def handle_client(self, data, addr, initial_packet):
+        """Runs in a dedicated thread for a specific client."""
+        # Create a dedicated socket for this specific client session
+        client_conn = JTPSocket(target_addr=addr)
+        
+        try:
+            header = JTPHeader.unpack(initial_packet)
+            if header.flags == FLAG_DATA:
+                client_conn._send_ack(addr, header.seq_num + 1)
+                
+                # Example Application layer response (Web Server)
+                html = "<html><body><h1>JTP V2 Enterprise Server</h1><p>Multithreaded & Windowed</p></body></html>"
+                resp = (f"HTTP/1.1 200 OK\r\nContent-Length: {len(html)}\r\nConnection: close\r\n\r\n{html}").encode()
+                
+                client_conn.send_reliable(resp, addr)
+                client_conn.close()  # Trigger the new FIN/ACK teardown
+                
+        except ValueError:
+            pass # Drop corrupted
+        finally:
+            if addr in self.clients:
+                del self.clients[addr]
+
+    def start(self):
+        """Dispatcher Loop."""
+        while True:
+            packet, addr = self.main_sock.recvfrom(2048)
+            if addr not in self.clients:
+                print(f"[Dispatcher] New concurrent client detected: {addr}. Spinning up thread.")
+                # Create a placeholder to prevent duplicate threads
+                self.clients[addr] = True 
+                # Dispatch worker thread
+                thread = threading.Thread(target=self.handle_client, args=(None, addr, packet))
+                thread.start()
