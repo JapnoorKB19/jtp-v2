@@ -1,6 +1,4 @@
-***
 
-```markdown
 # JTP V2: Jammu Transport Protocol (Enterprise Architecture)
 
 
