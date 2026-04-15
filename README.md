@@ -3,14 +3,8 @@
 ```markdown
 # JTP V2: Jammu Transport Protocol (Enterprise Architecture)
 
-![Python Version](https://img.shields.io/badge/python-3.x-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
-![Protocol](https://img.shields.io/badge/protocol-UDP%20%7C%20JTP-orange.svg)
 
 A custom, secure, and reliable Transport Layer protocol built entirely in user-space over standard UDP datagrams. This project fulfills an advanced networking stack requirement by upgrading to a multi-threaded architecture, implementing complex reliability mechanisms, and enforcing strict cryptographic data integrity.
-
-**Project Lead:** Japnoor Kaur (Mathematics and Computing, IIT Jammu)  
-**Team Members:** [Member 2], [Member 3], [Member 4], [Member 5]
 
 ---
 
